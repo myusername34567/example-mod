@@ -1,100 +1,244 @@
-/**
- * Include the Geode headers.
- */
 #include <Geode/Geode.hpp>
 
-/**
- * Brings cocos2d and all Geode namespaces to the current scope.
- */
+// Geode Hooks & Bindings
+#include <Geode/modify/InfoLayer.hpp>
+#include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/LevelSelectLayer.hpp>
+
+#include <Geode/binding/InfoLayer.hpp>
+#include <Geode/binding/CommentCell.hpp>
+#include <Geode/binding/GJComment.hpp>
+#include <Geode/binding/GJGameLevel.hpp>
+#include <Geode/binding/LevelPage.hpp>
+#include <Geode/binding/TableView.hpp>
+#include <Geode/binding/CCContentLayer.hpp>
+
+#include <matjson.hpp>
+#include <algorithm>
+#include <map>
+#include <string>
+
 using namespace geode::prelude;
 
-/**
- * `$modify` lets you extend and modify GD's classes.
- * To hook a function in Geode, simply $modify the class
- * and write a new function definition with the signature of
- * the function you want to hook.
- *
- * Here we use the overloaded `$modify` macro to set our own class name,
- * so that we can use it for button callbacks.
- *
- * Notice the header being included, you *must* include the header for
- * the class you are modifying, or you will get a compile error.
- *
- * Another way you could do this is like this:
- *
- * struct MyMenuLayer : Modify<MyMenuLayer, MenuLayer> {};
- */
-#include <Geode/modify/MenuLayer.hpp>
-class $modify(MyMenuLayer, MenuLayer) {
-	/**
-	 * Typically classes in GD are initialized using the `init` function, (though not always!),
-	 * so here we use it to add our own button to the bottom menu.
-	 *
-	 * Note that for all hooks, your signature has to *match exactly*,
-	 * `void init()` would not place a hook!
-	*/
-	bool init() {
-		/**
-		 * We call the original init function so that the
-		 * original class is properly initialized.
-		 */
-		if (!MenuLayer::init()) {
-			return false;
-		}
+// ============================================================================
+// DATA STRUCTURES & MANAGER CLASS (CustomMLManager)
+// ============================================================================
 
-		/**
-		 * You can use methods from the `geode::log` namespace to log messages to the console,
-		 * being useful for debugging and such. See this page for more info about logging:
-		 * https://docs.geode-sdk.org/tutorials/logging
-		*/
-		log::debug("Hello from my MenuLayer::init hook! This layer has {} children.", this->getChildrenCount());
+struct ReplacedLevelData {
+    int mainLevelID = 0;             // e.g., 1 for Stereo Madness
+    std::string originalName;
+    std::string customLevelString;   // Encoded level string
+    std::string customLevelName;
+};
 
-		/**
-		 * See this page for more info about buttons
-		 * https://docs.geode-sdk.org/tutorials/buttons
-		*/
-		auto myButton = CCMenuItemSpriteExtra::create(
-			CCSprite::createWithSpriteFrameName("GJ_likeBtn_001.png"),
-			this,
-			/**
-			 * Here we use the name we set earlier for our modify class.
-			*/
-			menu_selector(MyMenuLayer::onMyButton)
-		);
+class CustomMLManager {
+public:
+    static CustomMLManager* get() {
+        static CustomMLManager instance;
+        return &instance;
+    }
 
-		/**
-		 * Here we access the `bottom-menu` node by its ID, and add our button to it.
-		 * Node IDs are a Geode feature, see this page for more info about it:
-		 * https://docs.geode-sdk.org/tutorials/nodetree
-		*/
-		auto menu = this->getChildByID("bottom-menu");
-		menu->addChild(myButton);
+    std::map<int, ReplacedLevelData> m_replacedLevels;
 
-		/**
-		 * The `_spr` string literal operator just prefixes the string with
-		 * your mod id followed by a slash. This is good practice for setting your own node ids.
-		*/
-		myButton->setID("my-button"_spr);
+    // Returns path to: <GeodeSaveDir>/CustomML/
+    std::filesystem::path getCustomMLDir() {
+        auto dir = Mod::get()->getSaveDir() / "CustomML";
+        if (!std::filesystem::exists(dir)) {
+            std::filesystem::create_directories(dir);
+        }
+        return dir;
+    }
 
-		/**
-		 * We update the layout of the menu to ensure that our button is properly placed.
-		 * This is yet another Geode feature, see this page for more info about it:
-		 * https://docs.geode-sdk.org/tutorials/layouts
-		*/
-		menu->updateLayout();
+    void setReplacement(int mainLevelID, GJGameLevel* customLevel) {
+        if (!customLevel) return;
 
-		/**
-		 * We return `true` to indicate that the class was properly initialized.
-		 */
-		return true;
-	}
+        ReplacedLevelData data;
+        data.mainLevelID = mainLevelID;
+        data.customLevelName = customLevel->m_levelName;
+        data.customLevelString = customLevel->m_levelString;
 
-	/**
-	 * This is the callback function for the button we created earlier.
-	 * The signature for button callbacks must always be the same,
-	 * return type `void` and taking a `CCObject*`.
-	*/
-	void onMyButton(CCObject*) {
-		FLAlertLayer::create("Geode", "Hello from my custom mod!", "OK")->show();
-	}
+        m_replacedLevels[mainLevelID] = data;
+    }
+
+    void revertMainLevel(int mainLevelID) {
+        m_replacedLevels.erase(mainLevelID);
+    }
+
+    void revertAll() {
+        m_replacedLevels.clear();
+    }
+
+    bool isReplaced(int mainLevelID) const {
+        return m_replacedLevels.find(mainLevelID) != m_replacedLevels.end();
+    }
+
+    // Export ML Preset to CustomML folder
+    bool exportPreset(const std::string& packName) {
+        matjson::Value root = matjson::Object();
+        matjson::Value levelsArray = matjson::Array();
+
+        for (auto const& [id, data] : m_replacedLevels) {
+            matjson::Value item = matjson::Object();
+            item["mainLevelID"] = id;
+            item["customName"] = data.customLevelName;
+            item["levelData"] = data.customLevelString;
+            levelsArray.push_back(item);
+        }
+
+        root["packName"] = packName;
+        root["replacements"] = levelsArray;
+
+        auto filePath = getCustomMLDir() / (packName + ".json");
+        return utils::file::writeString(filePath, root.dump(2)).isOk();
+    }
+
+    // Import ML Preset from CustomML folder
+    bool importPreset(const std::string& packName) {
+        auto filePath = getCustomMLDir() / (packName + ".json");
+        auto readResult = utils::file::readString(filePath);
+        if (!readResult) return false;
+
+        auto res = matjson::parse(readResult.value());
+        if (!res) return false;
+
+        m_replacedLevels.clear();
+        auto root = res.value();
+
+        if (root.contains("replacements") && root["replacements"].is_array()) {
+            for (auto const& item : root["replacements"].asArray().value()) {
+                ReplacedLevelData data;
+                data.mainLevelID = item["mainLevelID"].asInt().value();
+                data.customLevelName = item["customName"].asString().value();
+                data.customLevelString = item["levelData"].asString().value();
+
+                m_replacedLevels[data.mainLevelID] = data;
+            }
+        }
+        return true;
+    }
+};
+
+// ============================================================================
+// FEATURE 1: COMMENT SEARCH ENGINE HOOK
+// ============================================================================
+
+class $modify(SearchableInfoLayer, InfoLayer) {
+    struct Fields {
+        TextInput* m_searchInput = nullptr;
+        std::string m_currentFilter = "";
+    };
+
+    bool init(GJGameLevel* level, GJUserScore* score, bool p2) {
+        if (!InfoLayer::init(level, score, p2)) return false;
+
+        // Container menu registered with NodeIDs tag
+        auto menu = CCMenu::create();
+        menu->setID("comment-search-menu"_spr);
+
+        // Geode TextInput for real-time comment filtering
+        auto input = TextInput::create(140.0f, "Search comments...", "chatFont.fnt");
+        input->setID("comment-search-input"_spr);
+        input->setCallback([this](const std::string& text) {
+            m_fields->m_currentFilter = text;
+            this->filterComments();
+        });
+
+        menu->addChild(input);
+
+        // Attach near the top right of the list container safely
+        if (auto listLayer = this->getChildByID("comments-list")) {
+            menu->setPosition({ listLayer->getPositionX() + 100.0f, listLayer->getPositionY() + 140.0f });
+        } else {
+            menu->setPosition({ 280.0f, 280.0f });
+        }
+
+        if (this->m_mainLayer) {
+            this->m_mainLayer->addChild(menu);
+        }
+        m_fields->m_searchInput = input;
+
+        return true;
+    }
+
+    void filterComments() {
+        if (!m_listLayer || !m_listLayer->m_listView) return;
+
+        auto contentLayer = m_listLayer->m_listView->m_contentLayer;
+        if (!contentLayer) return;
+
+        std::string filter = m_fields->m_currentFilter;
+        std::transform(filter.begin(), filter.end(), filter.begin(), ::tolower);
+
+        for (auto child : CCArrayExt<CCNode*>(contentLayer->getChildren())) {
+            if (auto cell = typeinfo_cast<CommentCell*>(child)) {
+                if (!cell->m_comment) continue;
+
+                std::string commentText = cell->m_comment->m_commentString;
+                std::transform(commentText.begin(), commentText.end(), commentText.begin(), ::tolower);
+
+                // Hide cell if it doesn't match current keyword
+                bool matches = filter.empty() || (commentText.find(filter) != std::string::npos);
+                cell->setVisible(matches);
+            }
+        }
+
+        contentLayer->updateLayout();
+    }
+};
+
+// ============================================================================
+// FEATURE 2: MAIN LEVEL SWAPPING HOOKS & UI
+// ============================================================================
+
+// PlayLayer hook: Swaps level strings dynamically upon starting a main level
+class $modify(MLPlayLayer, PlayLayer) {
+    static PlayLayer* create(GJGameLevel* level, bool useReplay, bool dontPost) {
+        if (level && level->m_levelType == GJLevelType::Local) {
+            int levelID = level->m_levelID.value();
+
+            if (CustomMLManager::get()->isReplaced(levelID)) {
+                auto const& overrideData = CustomMLManager::get()->m_replacedLevels[levelID];
+                
+                // Override raw level string and name on loading
+                level->m_levelString = overrideData.customLevelString;
+                level->m_levelName = overrideData.customLevelName;
+            }
+        }
+        return PlayLayer::create(level, useReplay, dontPost);
+    }
+};
+
+// LevelSelectLayer hook: Injects CustomML management button onto the screen
+class $modify(MLLevelSelectLayer, LevelSelectLayer) {
+    bool init(int page) {
+        if (!LevelSelectLayer::init(page)) return false;
+
+        auto menu = CCMenu::create();
+        menu->setID("custom-ml-menu"_spr);
+
+        auto btnSprite = ButtonSprite::create("CustomML", "goldFont.fnt", "GJ_button_01.png", 0.8f);
+        auto btn = CCMenuItemSpriteExtra::create(
+            btnSprite,
+            this,
+            menu_selector(MLLevelSelectLayer::onOpenCustomML)
+        );
+        btn->setID("custom-ml-button"_spr);
+
+        menu->addChild(btn);
+        menu->setPosition({ 50.0f, 50.0f });
+
+        this->addChild(menu);
+        return true;
+    }
+
+    void onOpenCustomML(CCObject* sender) {
+        std::string statusMessage = "CustomML Directory Active.\nSave directory:\n" + 
+                                    CustomMLManager::get()->getCustomMLDir().string();
+
+        FLAlertLayer::create(
+            "CustomML Manager",
+            statusMessage.c_str(),
+            "OK"
+        )->show();
+    }
 };

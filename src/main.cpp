@@ -1,6 +1,6 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/InfoLayer.hpp>
-#include <Geode/modify/GameManager.hpp>
+#include <Geode/modify/GameLevelManager.hpp>
 
 #include <filesystem>
 #include <fstream>
@@ -78,10 +78,12 @@ namespace CustomML {
         std::ifstream file(filePath);
         if (!file.is_open()) return false;
 
+        // FIX 1: matjson::parse returns a geode::Result, not std::optional.
+        // Use isOk()/unwrap() instead of has_value()/value().
         auto parseResult = matjson::parse(file);
-        if (!parseResult.has_value()) return false;
+        if (!parseResult.isOk()) return false;
 
-        auto root = parseResult.value();
+        auto root = parseResult.unwrap();
         if (!root.contains("levels") || !root["levels"].is_array()) return false;
 
         activeOverrides.clear();
@@ -101,21 +103,24 @@ namespace CustomML {
     }
 }
 
-// Hook GameManager to redirect Main Level calls to custom levels
-class $modify(CustomMLGameManager, GameManager) {
-    GJGameLevel* getGJMGL(int levelID) {
+// FIX 4: There is no GameManager::getGJMGL in the current bindings.
+// Main levels are actually retrieved through GameLevelManager::getMainLevel,
+// so we hook that instead of a nonexistent GameManager member.
+class $modify(CustomMLGameLevelManager, GameLevelManager) {
+    GJGameLevel* getMainLevel(int levelID, bool dontGetLevelString) {
         // Check if there's an active override for this main level ID
         if (CustomML::activeOverrides.contains(levelID)) {
             auto const& overrideData = CustomML::activeOverrides[levelID];
-            auto glm = GameLevelManager::sharedState();
 
             GJGameLevel* customLevel = nullptr;
 
             if (overrideData.isOnlineLevel) {
-                customLevel = glm->getSavedLevel(overrideData.customLevelID);
+                customLevel = this->getSavedLevel(overrideData.customLevelID);
             } else {
-                // Fetch from player's created local levels
-                auto localLevels = glm->m_localLevels;
+                // FIX 2/3: There is no m_localLevels member on GameLevelManager.
+                // Player-created levels are fetched via getSavedLevels(), which
+                // returns a CCArray*, so the CCArrayExt wrap below works directly.
+                auto localLevels = this->getSavedLevels(false, 0);
                 if (localLevels) {
                     for (auto item : CCArrayExt<GJGameLevel*>(localLevels)) {
                         if (item && item->m_levelID == overrideData.customLevelID) {
@@ -133,7 +138,7 @@ class $modify(CustomMLGameManager, GameManager) {
         }
 
         // Fallback to original GD 2.2081 main level logic
-        return GameManager::getGJMGL(levelID);
+        return GameLevelManager::getMainLevel(levelID, dontGetLevelString);
     }
 };
 
@@ -146,8 +151,9 @@ class $modify(SearchInfoLayer, InfoLayer) {
         TextInput* m_searchInput = nullptr;
     };
 
-    bool init(GJGameLevel* level, GJUserScore* score, bool p2) {
-        if (!InfoLayer::init(level, score, p2)) return false;
+    // FIX 5: InfoLayer::init's third parameter is a GJLevelList*, not a bool.
+    bool init(GJGameLevel* level, GJUserScore* score, GJLevelList* list) {
+        if (!InfoLayer::init(level, score, list)) return false;
 
         // Obtain or safely construct a node-ids compliant container menu
         auto menu = this->getChildByID("main-menu");
@@ -177,9 +183,14 @@ class $modify(SearchInfoLayer, InfoLayer) {
     }
 
     void filterComments(std::string const& query) {
-        if (!m_listLayer || !m_listLayer->m_listView) return;
+        // FIX 6: InfoLayer has no m_listLayer member. The comment list is
+        // InfoLayer::m_list (a GJCommentListLayer*), which itself wraps a
+        // BoomListView* in its own m_list field. The BoomListView's
+        // underlying TableView (m_tableView) holds the actual cell nodes
+        // in m_contentLayer.
+        if (!m_list || !m_list->m_list) return;
 
-        auto content = m_listLayer->m_listView->m_contentLayer;
+        auto content = m_list->m_list->m_tableView ? m_list->m_list->m_tableView->m_contentLayer : nullptr;
         if (!content) return;
 
         std::string lowerQuery = query;

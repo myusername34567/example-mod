@@ -1,244 +1,206 @@
 #include <Geode/Geode.hpp>
-
-// Geode Hooks & Bindings
 #include <Geode/modify/InfoLayer.hpp>
-#include <Geode/modify/PlayLayer.hpp>
-#include <Geode/modify/LevelSelectLayer.hpp>
+#include <Geode/modify/GameManager.hpp>
 
-#include <Geode/binding/InfoLayer.hpp>
-#include <Geode/binding/CommentCell.hpp>
-#include <Geode/binding/GJComment.hpp>
-#include <Geode/binding/GJGameLevel.hpp>
-#include <Geode/binding/LevelPage.hpp>
-#include <Geode/binding/TableView.hpp>
-#include <Geode/binding/CCContentLayer.hpp>
-
-#include <matjson.hpp>
+#include <filesystem>
+#include <fstream>
 #include <algorithm>
-#include <map>
+#include <unordered_map>
 #include <string>
 
 using namespace geode::prelude;
 
 // ============================================================================
-// DATA STRUCTURES & MANAGER CLASS (CustomMLManager)
+// 1. CUSTOM MAIN LEVEL MANAGER (CustomML)
 // ============================================================================
 
-struct ReplacedLevelData {
-    int mainLevelID = 0;             // e.g., 1 for Stereo Madness
-    std::string originalName;
-    std::string customLevelString;   // Encoded level string
-    std::string customLevelName;
-};
+namespace CustomML {
+    // Structure to hold custom level override info
+    struct LevelOverride {
+        int targetMainLevelID; // e.g. 1 for Stereo Madness
+        int customLevelID;     // The custom created/online level ID
+        bool isOnlineLevel;    // true = downloaded level, false = created level
+    };
 
-class CustomMLManager {
-public:
-    static CustomMLManager* get() {
-        static CustomMLManager instance;
-        return &instance;
-    }
+    // Active replacements map: <MainLevelID, OverrideData>
+    inline std::unordered_map<int, LevelOverride> activeOverrides;
 
-    std::map<int, ReplacedLevelData> m_replacedLevels;
-
-    // Returns path to: <GeodeSaveDir>/CustomML/
-    std::filesystem::path getCustomMLDir() {
-        auto dir = Mod::get()->getSaveDir() / "CustomML";
-        if (!std::filesystem::exists(dir)) {
-            std::filesystem::create_directories(dir);
+    // Helper to get or create <geode_save_dir>/CustomML/ folder
+    inline std::filesystem::path getFolder() {
+        auto path = Mod::get()->getSaveDir() / "CustomML";
+        if (!std::filesystem::exists(path)) {
+            std::filesystem::create_directories(path);
         }
-        return dir;
+        return path;
     }
 
-    void setReplacement(int mainLevelID, GJGameLevel* customLevel) {
-        if (!customLevel) return;
-
-        ReplacedLevelData data;
-        data.mainLevelID = mainLevelID;
-        data.customLevelName = customLevel->m_levelName;
-        data.customLevelString = customLevel->m_levelString;
-
-        m_replacedLevels[mainLevelID] = data;
+    // Set a level replacement
+    inline void setOverride(int mainLevelID, int customLevelID, bool isOnline) {
+        activeOverrides[mainLevelID] = { mainLevelID, customLevelID, isOnline };
     }
 
-    void revertMainLevel(int mainLevelID) {
-        m_replacedLevels.erase(mainLevelID);
+    // Clear all overrides (Revert to original main levels)
+    inline void revertAll() {
+        activeOverrides.clear();
+        log::info("All main levels reverted to default.");
     }
 
-    void revertAll() {
-        m_replacedLevels.clear();
-    }
+    // Save custom ML pack to JSON file for sharing
+    inline bool savePack(std::string const& packName) {
+        matjson::Value root = matjson::Value::object();
+        matjson::Value levels = matjson::Value::array();
 
-    bool isReplaced(int mainLevelID) const {
-        return m_replacedLevels.find(mainLevelID) != m_replacedLevels.end();
-    }
-
-    // Export ML Preset to CustomML folder
-    bool exportPreset(const std::string& packName) {
-        matjson::Value root = matjson::Object();
-        matjson::Value levelsArray = matjson::Array();
-
-        for (auto const& [id, data] : m_replacedLevels) {
-            matjson::Value item = matjson::Object();
-            item["mainLevelID"] = id;
-            item["customName"] = data.customLevelName;
-            item["levelData"] = data.customLevelString;
-            levelsArray.push_back(item);
+        for (auto const& [mainID, overrideData] : activeOverrides) {
+            matjson::Value item = matjson::Value::object();
+            item["main_id"] = overrideData.targetMainLevelID;
+            item["custom_id"] = overrideData.customLevelID;
+            item["is_online"] = overrideData.isOnlineLevel;
+            levels.push(item);
         }
 
-        root["packName"] = packName;
-        root["replacements"] = levelsArray;
+        root["pack_name"] = packName;
+        root["levels"] = levels;
 
-        auto filePath = getCustomMLDir() / (packName + ".json");
-        return utils::file::writeString(filePath, root.dump(2)).isOk();
-    }
+        auto filePath = getFolder() / (packName + ".json");
+        std::ofstream file(filePath);
+        if (!file.is_open()) return false;
 
-    // Import ML Preset from CustomML folder
-    bool importPreset(const std::string& packName) {
-        auto filePath = getCustomMLDir() / (packName + ".json");
-        auto readResult = utils::file::readString(filePath);
-        if (!readResult) return false;
-
-        auto res = matjson::parse(readResult.value());
-        if (!res) return false;
-
-        m_replacedLevels.clear();
-        auto root = res.value();
-
-        if (root.contains("replacements") && root["replacements"].is_array()) {
-            for (auto const& item : root["replacements"].asArray().value()) {
-                ReplacedLevelData data;
-                data.mainLevelID = item["mainLevelID"].asInt().value();
-                data.customLevelName = item["customName"].asString().value();
-                data.customLevelString = item["levelData"].asString().value();
-
-                m_replacedLevels[data.mainLevelID] = data;
-            }
-        }
+        file << root.dump(matjson::NO_INDENTATION);
+        log::info("Saved CustomML pack to {}", filePath.string());
         return true;
     }
+
+    // Load custom ML pack from a JSON file in CustomML folder
+    inline bool loadPack(std::string const& packName) {
+        auto filePath = getFolder() / (packName + ".json");
+        if (!std::filesystem::exists(filePath)) return false;
+
+        std::ifstream file(filePath);
+        if (!file.is_open()) return false;
+
+        auto parseResult = matjson::parse(file);
+        if (!parseResult.has_value()) return false;
+
+        auto root = parseResult.value();
+        if (!root.contains("levels") || !root["levels"].is_array()) return false;
+
+        activeOverrides.clear();
+
+        for (auto const& item : root["levels"].as_array().value()) {
+            if (item.contains("main_id") && item.contains("custom_id")) {
+                int mainID = item["main_id"].as_int().value();
+                int customID = item["custom_id"].as_int().value();
+                bool isOnline = item.contains("is_online") ? item["is_online"].as_bool().value() : true;
+
+                setOverride(mainID, customID, isOnline);
+            }
+        }
+
+        log::info("Loaded CustomML pack from {}", filePath.string());
+        return true;
+    }
+}
+
+// Hook GameManager to redirect Main Level calls to custom levels
+class $modify(CustomMLGameManager, GameManager) {
+    GJGameLevel* getGJMGL(int levelID) {
+        // Check if there's an active override for this main level ID
+        if (CustomML::activeOverrides.contains(levelID)) {
+            auto const& overrideData = CustomML::activeOverrides[levelID];
+            auto glm = GameLevelManager::sharedState();
+
+            GJGameLevel* customLevel = nullptr;
+
+            if (overrideData.isOnlineLevel) {
+                customLevel = glm->getSavedLevel(overrideData.customLevelID);
+            } else {
+                // Fetch from player's created local levels
+                auto localLevels = glm->m_localLevels;
+                if (localLevels) {
+                    for (auto item : CCArrayExt<GJGameLevel*>(localLevels)) {
+                        if (item && item->m_levelID == overrideData.customLevelID) {
+                            customLevel = item;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (customLevel) {
+                log::info("Replaced Main Level {} with Custom Level {}", levelID, overrideData.customLevelID);
+                return customLevel;
+            }
+        }
+
+        // Fallback to original GD 2.2081 main level logic
+        return GameManager::getGJMGL(levelID);
+    }
 };
 
 // ============================================================================
-// FEATURE 1: COMMENT SEARCH ENGINE HOOK
+// 2. COMMENT SEARCH IN INFOLAYER (NodeIDs Safe)
 // ============================================================================
 
-class $modify(SearchableInfoLayer, InfoLayer) {
+class $modify(SearchInfoLayer, InfoLayer) {
     struct Fields {
         TextInput* m_searchInput = nullptr;
-        std::string m_currentFilter = "";
     };
 
     bool init(GJGameLevel* level, GJUserScore* score, bool p2) {
         if (!InfoLayer::init(level, score, p2)) return false;
 
-        // Container menu registered with NodeIDs tag
-        auto menu = CCMenu::create();
-        menu->setID("comment-search-menu"_spr);
+        // Obtain or safely construct a node-ids compliant container menu
+        auto menu = this->getChildByID("main-menu");
+        if (!menu) {
+            menu = CCMenu::create();
+            menu->setID("comment-search-menu");
+            this->addChild(menu);
+        }
 
-        // Geode TextInput for real-time comment filtering
-        auto input = TextInput::create(140.0f, "Search comments...", "chatFont.fnt");
-        input->setID("comment-search-input"_spr);
-        input->setCallback([this](const std::string& text) {
-            m_fields->m_currentFilter = text;
-            this->filterComments();
+        // Create Search Box
+        auto searchInput = TextInput::create(140.f, "Search...", "chatFont.fnt");
+        searchInput->setID("comment-search-input");
+        searchInput->setScale(0.7f);
+
+        // Position on top-right of comment panel safely
+        searchInput->setPosition(ccp(120.f, 135.f));
+
+        // Text input callback filter
+        searchInput->setCallback([this](std::string const& text) {
+            this->filterComments(text);
         });
 
-        menu->addChild(input);
-
-        // Attach near the top right of the list container safely
-        if (auto listLayer = this->getChildByID("comments-list")) {
-            menu->setPosition({ listLayer->getPositionX() + 100.0f, listLayer->getPositionY() + 140.0f });
-        } else {
-            menu->setPosition({ 280.0f, 280.0f });
-        }
-
-        if (this->m_mainLayer) {
-            this->m_mainLayer->addChild(menu);
-        }
-        m_fields->m_searchInput = input;
+        m_fields->m_searchInput = searchInput;
+        menu->addChild(searchInput);
 
         return true;
     }
 
-    void filterComments() {
+    void filterComments(std::string const& query) {
         if (!m_listLayer || !m_listLayer->m_listView) return;
 
-        auto contentLayer = m_listLayer->m_listView->m_contentLayer;
-        if (!contentLayer) return;
+        auto content = m_listLayer->m_listView->m_contentLayer;
+        if (!content) return;
 
-        std::string filter = m_fields->m_currentFilter;
-        std::transform(filter.begin(), filter.end(), filter.begin(), ::tolower);
+        std::string lowerQuery = query;
+        std::transform(lowerQuery.begin(), lowerQuery.end(), lowerQuery.begin(), ::tolower);
 
-        for (auto child : CCArrayExt<CCNode*>(contentLayer->getChildren())) {
-            if (auto cell = typeinfo_cast<CommentCell*>(child)) {
-                if (!cell->m_comment) continue;
+        for (auto child : CCArrayExt<CCNode*>(content->getChildren())) {
+            auto cell = typeinfo_cast<CommentCell*>(child);
+            if (!cell || !cell->m_comment) continue;
 
-                std::string commentText = cell->m_comment->m_commentString;
-                std::transform(commentText.begin(), commentText.end(), commentText.begin(), ::tolower);
+            std::string commentText = cell->m_comment->m_commentString;
+            std::transform(commentText.begin(), commentText.end(), commentText.begin(), ::tolower);
 
-                // Hide cell if it doesn't match current keyword
-                bool matches = filter.empty() || (commentText.find(filter) != std::string::npos);
-                cell->setVisible(matches);
+            // Toggle cell visibility depending on search match
+            if (lowerQuery.empty() || commentText.find(lowerQuery) != std::string::npos) {
+                cell->setVisible(true);
+            } else {
+                cell->setVisible(false);
             }
         }
 
-        contentLayer->updateLayout();
-    }
-};
-
-// ============================================================================
-// FEATURE 2: MAIN LEVEL SWAPPING HOOKS & UI
-// ============================================================================
-
-// PlayLayer hook: Swaps level strings dynamically upon starting a main level
-class $modify(MLPlayLayer, PlayLayer) {
-    static PlayLayer* create(GJGameLevel* level, bool useReplay, bool dontPost) {
-        if (level && level->m_levelType == GJLevelType::Local) {
-            int levelID = level->m_levelID.value();
-
-            if (CustomMLManager::get()->isReplaced(levelID)) {
-                auto const& overrideData = CustomMLManager::get()->m_replacedLevels[levelID];
-                
-                // Override raw level string and name on loading
-                level->m_levelString = overrideData.customLevelString;
-                level->m_levelName = overrideData.customLevelName;
-            }
-        }
-        return PlayLayer::create(level, useReplay, dontPost);
-    }
-};
-
-// LevelSelectLayer hook: Injects CustomML management button onto the screen
-class $modify(MLLevelSelectLayer, LevelSelectLayer) {
-    bool init(int page) {
-        if (!LevelSelectLayer::init(page)) return false;
-
-        auto menu = CCMenu::create();
-        menu->setID("custom-ml-menu"_spr);
-
-        auto btnSprite = ButtonSprite::create("CustomML", "goldFont.fnt", "GJ_button_01.png", 0.8f);
-        auto btn = CCMenuItemSpriteExtra::create(
-            btnSprite,
-            this,
-            menu_selector(MLLevelSelectLayer::onOpenCustomML)
-        );
-        btn->setID("custom-ml-button"_spr);
-
-        menu->addChild(btn);
-        menu->setPosition({ 50.0f, 50.0f });
-
-        this->addChild(menu);
-        return true;
-    }
-
-    void onOpenCustomML(CCObject* sender) {
-        std::string statusMessage = "CustomML Directory Active.\nSave directory:\n" + 
-                                    CustomMLManager::get()->getCustomMLDir().string();
-
-        FLAlertLayer::create(
-            "CustomML Manager",
-            statusMessage.c_str(),
-            "OK"
-        )->show();
+        // Re-arrange layout dynamically
+        content->updateLayout();
     }
 };

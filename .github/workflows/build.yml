@@ -20,11 +20,11 @@ jobs:
             os: macos-latest
             target: mac
 
-          - name: Android32
+          - name: Android (32-bit)
             os: ubuntu-latest
             target: android32
 
-          - name: Android64
+          - name: Android (64-bit)
             os: ubuntu-latest
             target: android64
 
@@ -33,6 +33,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Build the mod
         uses: geode-sdk/build-geode-mod@main

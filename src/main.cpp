@@ -43,7 +43,6 @@ jobs:
         uses: geode-sdk/build-geode-mod@main
         with:
           target: ${{ matrix.config.target }}
-          cmake-args: "-DSKIP_BUILDING_CODEGEN=OFF"
 
   combine:
     name: Combine Artifacts

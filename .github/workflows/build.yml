@@ -1,12 +1,10 @@
 name: Build Geode Mod
 
 on:
+  workflow_dispatch:
   push:
     branches:
-      - main
-      - master
-  pull_request:
-  workflow_dispatch:
+      - "**"
 
 jobs:
   build:
@@ -17,38 +15,41 @@ jobs:
           - name: Windows
             os: windows-latest
             target: win
-          - name: Android (64-bit)
-            os: ubuntu-latest
-            target: android64
-          - name: Android (32-bit)
-            os: ubuntu-latest
-            target: android32
+
           - name: macOS
             os: macos-latest
             target: mac
-          - name: iOS
-            os: macos-latest
-            target: ios
 
-    name: Build ${{ matrix.config.name }}
+          - name: Android32
+            os: ubuntu-latest
+            target: android32
+
+          - name: Android64
+            os: ubuntu-latest
+            target: android64
+
+    name: ${{ matrix.config.name }}
     runs-on: ${{ matrix.config.os }}
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - uses: actions/checkout@v4
 
-      - name: Build Geode Mod
-        uses: geode-sdk/build-geode-mod@v2
+      - name: Build the mod
+        uses: geode-sdk/build-geode-mod@main
         with:
+          combine: true
           target: ${{ matrix.config.target }}
-          cmake-args: "-DSKIP_BUILDING_CODEGEN=OFF"
 
-  combine:
-    name: Combine Artifacts
+  package:
+    name: Package builds
     runs-on: ubuntu-latest
-    needs: build
+    needs: ['build']
+
     steps:
-      - name: Combine Builds
-        uses: geode-sdk/build-geode-mod/combine@v2
+      - uses: geode-sdk/build-geode-mod/combine@main
+        id: build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Build Output
+          path: ${{ steps.build.outputs.build-output }}

@@ -1,217 +1,150 @@
 #include <Geode/Geode.hpp>
-#include <Geode/modify/InfoLayer.hpp>
-#include <Geode/modify/GameLevelManager.hpp>
-
-#include <filesystem>
-#include <fstream>
+#include <Geode/modify/EditorUI.hpp>
+#include <unordered_set>
+#include <cmath>
 #include <algorithm>
-#include <unordered_map>
-#include <string>
 
 using namespace geode::prelude;
 
-// ============================================================================
-// 1. CUSTOM MAIN LEVEL MANAGER (CustomML)
-// ============================================================================
+// Better AutoBuild
+// A recreation of Antiprime's AutoBuild mod: toggle a mode in the editor
+// that lets you click-and-drag to stamp the currently selected build
+// object along the grid, instead of placing one object per tap.
 
-namespace CustomML {
-    // Structure to hold custom level override info
-    struct LevelOverride {
-        int targetMainLevelID; // e.g. 1 for Stereo Madness
-        int customLevelID;     // The custom created/online level ID
-        bool isOnlineLevel;    // true = downloaded level, false = created level
-    };
-
-    // Active replacements map: <MainLevelID, OverrideData>
-    inline std::unordered_map<int, LevelOverride> activeOverrides;
-
-    // Helper to get or create <geode_save_dir>/CustomML/ folder
-    inline std::filesystem::path getFolder() {
-        auto path = Mod::get()->getSaveDir() / "CustomML";
-        if (!std::filesystem::exists(path)) {
-            std::filesystem::create_directories(path);
-        }
-        return path;
-    }
-
-    // Set a level replacement
-    inline void setOverride(int mainLevelID, int customLevelID, bool isOnline) {
-        activeOverrides[mainLevelID] = { mainLevelID, customLevelID, isOnline };
-    }
-
-    // Clear all overrides (Revert to original main levels)
-    inline void revertAll() {
-        activeOverrides.clear();
-        log::info("All main levels reverted to default.");
-    }
-
-    // Save custom ML pack to JSON file for sharing
-    inline bool savePack(std::string const& packName) {
-        matjson::Value root = matjson::Value::object();
-        matjson::Value levels = matjson::Value::array();
-
-        for (auto const& [mainID, overrideData] : activeOverrides) {
-            matjson::Value item = matjson::Value::object();
-            item["main_id"] = overrideData.targetMainLevelID;
-            item["custom_id"] = overrideData.customLevelID;
-            item["is_online"] = overrideData.isOnlineLevel;
-            levels.push(item);
-        }
-
-        root["pack_name"] = packName;
-        root["levels"] = levels;
-
-        auto filePath = getFolder() / (packName + ".json");
-        std::ofstream file(filePath);
-        if (!file.is_open()) return false;
-
-        file << root.dump(matjson::NO_INDENTATION);
-        log::info("Saved CustomML pack to {}", filePath.string());
-        return true;
-    }
-
-    // Load custom ML pack from a JSON file in CustomML folder
-    inline bool loadPack(std::string const& packName) {
-        auto filePath = getFolder() / (packName + ".json");
-        if (!std::filesystem::exists(filePath)) return false;
-
-        std::ifstream file(filePath);
-        if (!file.is_open()) return false;
-
-        // FIX 1: matjson::parse returns a geode::Result, not std::optional.
-        // Use isOk()/unwrap() instead of has_value()/value().
-        auto parseResult = matjson::parse(file);
-        if (!parseResult.isOk()) return false;
-
-        auto root = parseResult.unwrap();
-        if (!root.contains("levels") || !root["levels"].is_array()) return false;
-
-        activeOverrides.clear();
-
-        for (auto const& item : root["levels"].as_array().value()) {
-            if (item.contains("main_id") && item.contains("custom_id")) {
-                int mainID = item["main_id"].as_int().value();
-                int customID = item["custom_id"].as_int().value();
-                bool isOnline = item.contains("is_online") ? item["is_online"].as_bool().value() : true;
-
-                setOverride(mainID, customID, isOnline);
-            }
-        }
-
-        log::info("Loaded CustomML pack from {}", filePath.string());
-        return true;
-    }
-}
-
-// FIX 4: There is no GameManager::getGJMGL in the current bindings.
-// Main levels are actually retrieved through GameLevelManager::getMainLevel,
-// so we hook that instead of a nonexistent GameManager member.
-class $modify(CustomMLGameLevelManager, GameLevelManager) {
-    GJGameLevel* getMainLevel(int levelID, bool dontGetLevelString) {
-        // Check if there's an active override for this main level ID
-        if (CustomML::activeOverrides.contains(levelID)) {
-            auto const& overrideData = CustomML::activeOverrides[levelID];
-
-            GJGameLevel* customLevel = nullptr;
-
-            if (overrideData.isOnlineLevel) {
-                customLevel = this->getSavedLevel(overrideData.customLevelID);
-            } else {
-                // FIX 2/3: There is no m_localLevels member on GameLevelManager.
-                // Player-created levels are fetched via getSavedLevels(), which
-                // returns a CCArray*, so the CCArrayExt wrap below works directly.
-                auto localLevels = this->getSavedLevels(false, 0);
-                if (localLevels) {
-                    for (auto item : CCArrayExt<GJGameLevel*>(localLevels)) {
-                        if (item && item->m_levelID == overrideData.customLevelID) {
-                            customLevel = item;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if (customLevel) {
-                log::info("Replaced Main Level {} with Custom Level {}", levelID, overrideData.customLevelID);
-                return customLevel;
-            }
-        }
-
-        // Fallback to original GD 2.2081 main level logic
-        return GameLevelManager::getMainLevel(levelID, dontGetLevelString);
-    }
-};
-
-// ============================================================================
-// 2. COMMENT SEARCH IN INFOLAYER (NodeIDs Safe)
-// ============================================================================
-
-class $modify(SearchInfoLayer, InfoLayer) {
+class $modify(BABEditorUI, EditorUI) {
     struct Fields {
-        TextInput* m_searchInput = nullptr;
+        bool autoBuildActive = false;
+        int currentObjectID = 1;
+        CCMenuItemSpriteExtra* autoBuildBtn = nullptr;
+        std::unordered_set<int64_t> visitedCells;
+        CCPoint lastRawTouchPos = { 0.f, 0.f };
+        bool hasLastTouch = false;
     };
 
-    // FIX 5: InfoLayer::init's third parameter is a GJLevelList*, not a bool.
-    bool init(GJGameLevel* level, GJUserScore* score, GJLevelList* list) {
-        if (!InfoLayer::init(level, score, list)) return false;
+    bool init(LevelEditorLayer* editorLayer) {
+        if (!EditorUI::init(editorLayer)) return false;
 
-        // Obtain or safely construct a node-ids compliant container menu
-        auto menu = this->getChildByID("main-menu");
-        if (!menu) {
-            menu = CCMenu::create();
-            menu->setID("comment-search-menu");
-            this->addChild(menu);
-        }
+        auto winSize = CCDirector::sharedDirector()->getWinSize();
 
-        // Create Search Box
-        auto searchInput = TextInput::create(140.f, "Search...", "chatFont.fnt");
-        searchInput->setID("comment-search-input");
-        searchInput->setScale(0.7f);
+        auto offSprite = ButtonSprite::create("AB", "bigFont.fnt", "GJ_button_04.png", 0.8f);
+        offSprite->setScale(0.65f);
 
-        // Position on top-right of comment panel safely
-        searchInput->setPosition(ccp(120.f, 135.f));
+        m_fields->autoBuildBtn = CCMenuItemSpriteExtra::create(
+            offSprite, this, menu_selector(BABEditorUI::onToggleAutoBuild)
+        );
+        m_fields->autoBuildBtn->setID("better-autobuild-toggle-btn"_spr);
 
-        // Text input callback filter
-        searchInput->setCallback([this](std::string const& text) {
-            this->filterComments(text);
-        });
-
-        m_fields->m_searchInput = searchInput;
-        menu->addChild(searchInput);
+        auto menu = CCMenu::create();
+        menu->addChild(m_fields->autoBuildBtn);
+        menu->setPosition({ winSize.width - 30.f, winSize.height - 120.f });
+        menu->setZOrder(200);
+        menu->setID("better-autobuild-menu"_spr);
+        this->addChild(menu, 200);
 
         return true;
     }
 
-    void filterComments(std::string const& query) {
-        // FIX 6: InfoLayer has no m_listLayer member. The comment list is
-        // InfoLayer::m_list (a GJCommentListLayer*), which itself wraps a
-        // BoomListView* in its own m_list field. The BoomListView's
-        // underlying TableView (m_tableView) holds the actual cell nodes
-        // in m_contentLayer.
-        if (!m_list || !m_list->m_list) return;
+    // Track whatever build item the player last picked from the create menu,
+    // so AutoBuild knows what to stamp along the drag.
+    void onCreateObject(int id) {
+        EditorUI::onCreateObject(id);
+        m_fields->currentObjectID = id;
+    }
 
-        auto content = m_list->m_list->m_tableView ? m_list->m_list->m_tableView->m_contentLayer : nullptr;
-        if (!content) return;
+    void onToggleAutoBuild(CCObject*) {
+        m_fields->autoBuildActive = !m_fields->autoBuildActive;
+        m_fields->visitedCells.clear();
+        m_fields->hasLastTouch = false;
 
-        std::string lowerQuery = query;
-        std::transform(lowerQuery.begin(), lowerQuery.end(), lowerQuery.begin(), ::tolower);
-
-        for (auto child : CCArrayExt<CCNode*>(content->getChildren())) {
-            auto cell = typeinfo_cast<CommentCell*>(child);
-            if (!cell || !cell->m_comment) continue;
-
-            std::string commentText = cell->m_comment->m_commentString;
-            std::transform(commentText.begin(), commentText.end(), commentText.begin(), ::tolower);
-
-            // Toggle cell visibility depending on search match
-            if (lowerQuery.empty() || commentText.find(lowerQuery) != std::string::npos) {
-                cell->setVisible(true);
-            } else {
-                cell->setVisible(false);
-            }
+        auto sprite = static_cast<ButtonSprite*>(m_fields->autoBuildBtn->getNormalImage());
+        if (m_fields->autoBuildActive) {
+            auto color = Mod::get()->getSettingValue<ccColor3B>("auto-select-color");
+            sprite->setColor(color);
+        } else {
+            sprite->setColor({ 255, 255, 255 });
         }
+    }
 
-        // Re-arrange layout dynamically
-        content->updateLayout();
+    float babGridSize() {
+        return m_gridSize > 0.f ? m_gridSize : 30.f;
+    }
+
+    int64_t babCellKey(CCPoint snapped) {
+        float g = babGridSize();
+        int64_t gx = static_cast<int64_t>(std::lround(snapped.x / g));
+        int64_t gy = static_cast<int64_t>(std::lround(snapped.y / g));
+        return (gx << 32) ^ (gy & 0xffffffffLL);
+    }
+
+    void babPlaceIfNew(CCPoint rawPos) {
+        if (m_fields->currentObjectID <= 0) return;
+
+        auto snapped = this->getGridSnappedPos(rawPos);
+        auto key = babCellKey(snapped);
+        if (m_fields->visitedCells.count(key)) return;
+        m_fields->visitedCells.insert(key);
+
+        this->createObject(m_fields->currentObjectID, snapped);
+    }
+
+    // Samples points between two raw touch positions so a fast drag doesn't
+    // leave gaps between placed objects, then snaps + dedupes each sample.
+    void babPlaceAlongLine(CCPoint from, CCPoint to) {
+        float g = babGridSize();
+        float fraction = static_cast<float>(Mod::get()->getSettingValue<double>("step-fraction"));
+        float step = std::max(g * fraction, 2.f);
+
+        float dist = ccpDistance(from, to);
+        int steps = static_cast<int>(dist / step) + 1;
+
+        for (int i = 0; i <= steps; i++) {
+            float t = steps == 0 ? 0.f : static_cast<float>(i) / static_cast<float>(steps);
+            babPlaceIfNew(ccpLerp(from, to, t));
+        }
+    }
+
+    bool ccTouchBegan(CCTouch* touch, CCEvent* event) {
+        if (m_fields->autoBuildActive) {
+            auto pos = this->getTouchPoint(touch, event);
+            m_fields->visitedCells.clear();
+            babPlaceIfNew(pos);
+            m_fields->lastRawTouchPos = pos;
+            m_fields->hasLastTouch = true;
+            return true;
+        }
+        return EditorUI::ccTouchBegan(touch, event);
+    }
+
+    void ccTouchMoved(CCTouch* touch, CCEvent* event) {
+        if (m_fields->autoBuildActive) {
+            auto pos = this->getTouchPoint(touch, event);
+            if (m_fields->hasLastTouch) {
+                babPlaceAlongLine(m_fields->lastRawTouchPos, pos);
+            } else {
+                babPlaceIfNew(pos);
+            }
+            m_fields->lastRawTouchPos = pos;
+            m_fields->hasLastTouch = true;
+            return;
+        }
+        EditorUI::ccTouchMoved(touch, event);
+    }
+
+    void ccTouchEnded(CCTouch* touch, CCEvent* event) {
+        if (m_fields->autoBuildActive) {
+            m_fields->visitedCells.clear();
+            m_fields->hasLastTouch = false;
+            return;
+        }
+        EditorUI::ccTouchEnded(touch, event);
+    }
+
+    void ccTouchCancelled(CCTouch* touch, CCEvent* event) {
+        if (m_fields->autoBuildActive) {
+            m_fields->visitedCells.clear();
+            m_fields->hasLastTouch = false;
+            return;
+        }
+        EditorUI::ccTouchCancelled(touch, event);
     }
 };

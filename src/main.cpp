@@ -1,150 +1,386 @@
 #include <Geode/Geode.hpp>
-#include <Geode/modify/EditorUI.hpp>
-#include <unordered_set>
-#include <cmath>
+#include <Geode/modify/LevelEditorLayer.hpp>
+#include <Geode/ui/Popup.hpp>
+#include <Geode/ui/TextInput.hpp>
+#include <Geode/binding/EditorUI.hpp>
+#include <Geode/binding/LevelEditorLayer.hpp>
+#include <Geode/binding/CCMenuItemSpriteExtra.hpp>
+#include <Geode/binding/ButtonSprite.hpp>
+#include <Geode/binding/FLAlertLayer.hpp>
+#include <Geode/cocos/menu_nodes/CCMenu.h>
+
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <string>
 #include <algorithm>
+#include <cctype>
 
 using namespace geode::prelude;
 
-// Better AutoBuild
-// A recreation of Antiprime's AutoBuild mod: toggle a mode in the editor
-// that lets you click-and-drag to stamp the currently selected build
-// object along the grid, instead of placing one object per tap.
+struct TBLIBPiece {
+    std::string name;
+    std::string objects;
+    size_t objectCount = 0;
+};
 
-class $modify(BABEditorUI, EditorUI) {
-    struct Fields {
-        bool autoBuildActive = false;
-        int currentObjectID = 1;
-        CCMenuItemSpriteExtra* autoBuildBtn = nullptr;
-        std::unordered_set<int64_t> visitedCells;
-        CCPoint lastRawTouchPos = { 0.f, 0.f };
-        bool hasLastTouch = false;
+struct TBLIBLibrary {
+    std::string name;
+    std::string algorithm;
+    std::vector<TBLIBPiece> pieces;
+};
+
+static std::vector<TBLIBLibrary> g_libraries;
+static bool g_loaded = false;
+
+static std::vector<std::string> splitLines(std::string const& s) {
+    std::vector<std::string> out;
+    std::stringstream ss(s);
+    std::string line;
+    while (std::getline(ss, line)) {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        out.push_back(line);
+    }
+    return out;
+}
+
+static std::string trim(std::string s) {
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front())))
+        s.erase(s.begin());
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back())))
+        s.pop_back();
+    return s;
+}
+
+static bool isSerializedObject(std::string const& line) {
+    // TBLIB object records are comma-separated key/value pairs and start with key 1.
+    return line.rfind("1,", 0) == 0;
+}
+
+static void parsePieceBlock(
+    TBLIBLibrary& lib,
+    std::vector<std::string> const& block,
+    size_t index
+) {
+    if (block.empty())
+        return;
+
+    std::string objectData;
+    size_t objectCount = 0;
+
+    for (auto const& raw : block) {
+        auto line = trim(raw);
+        if (!isSerializedObject(line))
+            continue;
+
+        objectData += line;
+        if (!objectData.empty() && objectData.back() != ';')
+            objectData.push_back(';');
+
+        // A single TBLIB line can contain multiple object records separated by ';'.
+        for (char c : line)
+            if (c == ';')
+                ++objectCount;
+    }
+
+    if (objectData.empty())
+        return;
+
+    TBLIBPiece piece;
+    piece.name = fmt::format("{} #{}", lib.name, index);
+    piece.objects = std::move(objectData);
+    piece.objectCount = objectCount;
+    lib.pieces.push_back(std::move(piece));
+}
+
+static void loadLibraries() {
+    if (g_loaded)
+        return;
+    g_loaded = true;
+
+    auto dir = Mod::get()->getResourcesDir() / "templates";
+    std::vector<std::string> files = {
+        "hell_temp.tblib",
+        "hell_base.tblib",
+        "modern_base.tblib",
+        "modern_temp.tblib",
+        "null_base.tblib",
+        "null_temp.tblib",
+        "pt_base.tblib",
+        "tech_temp.tblib",
+        "wfc_base.tblib",
+        "tech_base.tblib"
     };
 
-    bool init(LevelEditorLayer* editorLayer) {
-        if (!EditorUI::init(editorLayer)) return false;
+    for (auto const& file : files) {
+        auto path = dir / file;
+        std::ifstream in(path, std::ios::binary);
+        if (!in)
+            continue;
 
-        auto winSize = CCDirector::sharedDirector()->getWinSize();
+        std::stringstream buffer;
+        buffer << in.rdbuf();
+        auto lines = splitLines(buffer.str());
 
-        auto offSprite = ButtonSprite::create("AB", "bigFont.fnt", "GJ_button_04.png", 0.8f);
-        offSprite->setScale(0.65f);
+        TBLIBLibrary lib;
+        lib.name = file.substr(0, file.find(".tblib"));
 
-        m_fields->autoBuildBtn = CCMenuItemSpriteExtra::create(
-            offSprite, this, menu_selector(BABEditorUI::onToggleAutoBuild)
+        if (lines.size() > 1 && lines[1].rfind("ALG ", 0) == 0)
+            lib.algorithm = lines[1].substr(4);
+
+        auto piecesIt = std::find_if(lines.begin(), lines.end(), [](std::string const& l) {
+            return l.rfind("PIECES ", 0) == 0;
+        });
+        if (piecesIt == lines.end())
+            continue;
+
+        std::vector<std::string> block;
+        size_t pieceIndex = 0;
+        bool first = true;
+
+        // PIECES blocks are separated by --- and continue until the next
+        // top-level section such as PM/FILLERS/Rxxx.
+        for (size_t i = static_cast<size_t>(piecesIt - lines.begin()) + 1; i < lines.size(); ++i) {
+            auto const& line = lines[i];
+
+            if (line == "---") {
+                if (!block.empty()) {
+                    parsePieceBlock(lib, block, pieceIndex++);
+                    block.clear();
+                }
+                continue;
+            }
+
+            // A top-level non-numeric section marks the end of PIECES.
+            bool startsNumeric = !line.empty() &&
+                (std::isdigit(static_cast<unsigned char>(line[0])) || line[0] == '-');
+
+            if (!startsNumeric && line.rfind("PIECES ", 0) != 0) {
+                if (!block.empty())
+                    parsePieceBlock(lib, block, pieceIndex++);
+                break;
+            }
+
+            if (!first || line.rfind("PIECES ", 0) != 0)
+                block.push_back(line);
+            first = false;
+        }
+
+        if (!block.empty())
+            parsePieceBlock(lib, block, pieceIndex++);
+
+        if (!lib.pieces.empty())
+            g_libraries.push_back(std::move(lib));
+    }
+
+    log::info("Loaded {} TBLIB libraries / {} pieces",
+        g_libraries.size(),
+        std::accumulate(g_libraries.begin(), g_libraries.end(), size_t{0},
+            [](size_t n, TBLIBLibrary const& l) { return n + l.pieces.size(); }));
+}
+
+class TemplatePopup : public geode::Popup {
+protected:
+    LevelEditorLayer* m_editor = nullptr;
+    geode::TextInput* m_query = nullptr;
+    geode::TextInput* m_x = nullptr;
+    geode::TextInput* m_y = nullptr;
+
+    bool init(LevelEditorLayer* editor) {
+        if (!Popup::init(360.f, 230.f))
+            return false;
+
+        m_editor = editor;
+        this->setTitle("TBLIB AutoBuild");
+
+        auto info = CCLabelBMFont::create(
+            "Enter library:piece  (example: hell_temp:0)",
+            "goldFont.fnt"
         );
-        m_fields->autoBuildBtn->setID("better-autobuild-toggle-btn"_spr);
+        info->setScale(.42f);
+        info->setPosition({180.f, 180.f});
+        m_mainLayer->addChild(info);
+
+        m_query = geode::TextInput::create(300.f, "library:piece", "bigFont.fnt");
+        m_query->setPosition({180.f, 140.f});
+        m_query->setMaxCharCount(48);
+        m_mainLayer->addChild(m_query);
+
+        m_x = geode::TextInput::create(135.f, "X (blank = click)", "bigFont.fnt");
+        m_x->setPosition({105.f, 95.f});
+        m_x->setMaxCharCount(16);
+        m_mainLayer->addChild(m_x);
+
+        m_y = geode::TextInput::create(135.f, "Y (blank = click)", "bigFont.fnt");
+        m_y->setPosition({255.f, 95.f});
+        m_y->setMaxCharCount(16);
+        m_mainLayer->addChild(m_y);
 
         auto menu = CCMenu::create();
-        menu->addChild(m_fields->autoBuildBtn);
-        menu->setPosition({ winSize.width - 30.f, winSize.height - 120.f });
-        menu->setZOrder(200);
-        menu->setID("better-autobuild-menu"_spr);
-        this->addChild(menu, 200);
+        menu->setPosition({180.f, 45.f});
+        m_mainLayer->addChild(menu);
+
+        auto place = CCMenuItemSpriteExtra::create(
+            ButtonSprite::create("Place"),
+            this,
+            menu_selector(TemplatePopup::onPlace)
+        );
+        menu->addChild(place);
+
+        auto list = CCMenuItemSpriteExtra::create(
+            ButtonSprite::create("List"),
+            this,
+            menu_selector(TemplatePopup::onList)
+        );
+        list->setPosition({-105.f, 0.f});
+        menu->addChild(list);
 
         return true;
     }
 
-    // Track whatever build item the player last picked from the create menu,
-    // so AutoBuild knows what to stamp along the drag.
-    void onCreateObject(int id) {
-        EditorUI::onCreateObject(id);
-        m_fields->currentObjectID = id;
-    }
-
-    void onToggleAutoBuild(CCObject*) {
-        m_fields->autoBuildActive = !m_fields->autoBuildActive;
-        m_fields->visitedCells.clear();
-        m_fields->hasLastTouch = false;
-
-        auto sprite = static_cast<ButtonSprite*>(m_fields->autoBuildBtn->getNormalImage());
-        if (m_fields->autoBuildActive) {
-            auto color = Mod::get()->getSettingValue<ccColor3B>("auto-select-color");
-            sprite->setColor(color);
-        } else {
-            sprite->setColor({ 255, 255, 255 });
+    static bool parseFloat(std::string const& s, float& out) {
+        if (s.empty())
+            return false;
+        try {
+            size_t used = 0;
+            out = std::stof(s, &used);
+            return used == s.size();
+        } catch (...) {
+            return false;
         }
     }
 
-    float babGridSize() {
-        return m_gridSize > 0.f ? m_gridSize : 30.f;
-    }
+    bool parseSelection(std::string const& text, size_t& libIndex, size_t& pieceIndex) {
+        auto colon = text.find(':');
+        if (colon == std::string::npos)
+            return false;
 
-    int64_t babCellKey(CCPoint snapped) {
-        float g = babGridSize();
-        int64_t gx = static_cast<int64_t>(std::lround(snapped.x / g));
-        int64_t gy = static_cast<int64_t>(std::lround(snapped.y / g));
-        return (gx << 32) ^ (gy & 0xffffffffLL);
-    }
+        auto libName = text.substr(0, colon);
+        auto pieceText = text.substr(colon + 1);
 
-    void babPlaceIfNew(CCPoint rawPos) {
-        if (m_fields->currentObjectID <= 0) return;
-
-        auto snapped = this->getGridSnappedPos(rawPos);
-        auto key = babCellKey(snapped);
-        if (m_fields->visitedCells.count(key)) return;
-        m_fields->visitedCells.insert(key);
-
-        this->createObject(m_fields->currentObjectID, snapped);
-    }
-
-    // Samples points between two raw touch positions so a fast drag doesn't
-    // leave gaps between placed objects, then snaps + dedupes each sample.
-    void babPlaceAlongLine(CCPoint from, CCPoint to) {
-        float g = babGridSize();
-        float fraction = static_cast<float>(Mod::get()->getSettingValue<double>("step-fraction"));
-        float step = std::max(g * fraction, 2.f);
-
-        float dist = ccpDistance(from, to);
-        int steps = static_cast<int>(dist / step) + 1;
-
-        for (int i = 0; i <= steps; i++) {
-            float t = steps == 0 ? 0.f : static_cast<float>(i) / static_cast<float>(steps);
-            babPlaceIfNew(ccpLerp(from, to, t));
+        try {
+            pieceIndex = std::stoul(pieceText);
+        } catch (...) {
+            return false;
         }
-    }
 
-    bool ccTouchBegan(CCTouch* touch, CCEvent* event) {
-        if (m_fields->autoBuildActive) {
-            auto pos = this->getTouchPoint(touch, event);
-            m_fields->visitedCells.clear();
-            babPlaceIfNew(pos);
-            m_fields->lastRawTouchPos = pos;
-            m_fields->hasLastTouch = true;
-            return true;
-        }
-        return EditorUI::ccTouchBegan(touch, event);
-    }
-
-    void ccTouchMoved(CCTouch* touch, CCEvent* event) {
-        if (m_fields->autoBuildActive) {
-            auto pos = this->getTouchPoint(touch, event);
-            if (m_fields->hasLastTouch) {
-                babPlaceAlongLine(m_fields->lastRawTouchPos, pos);
-            } else {
-                babPlaceIfNew(pos);
+        for (size_t i = 0; i < g_libraries.size(); ++i) {
+            if (g_libraries[i].name == libName) {
+                libIndex = i;
+                return pieceIndex < g_libraries[i].pieces.size();
             }
-            m_fields->lastRawTouchPos = pos;
-            m_fields->hasLastTouch = true;
-            return;
         }
-        EditorUI::ccTouchMoved(touch, event);
+        return false;
     }
 
-    void ccTouchEnded(CCTouch* touch, CCEvent* event) {
-        if (m_fields->autoBuildActive) {
-            m_fields->visitedCells.clear();
-            m_fields->hasLastTouch = false;
+    void onPlace(CCObject*) {
+        auto selection = m_query->getString();
+        size_t li = 0, pi = 0;
+
+        if (!parseSelection(selection, li, pi)) {
+            FLAlertLayer::create(
+                "TBLIB AutoBuild",
+                "Invalid template. Use a name such as <cy>hell_temp:0</c>.",
+                "OK"
+            )->show();
             return;
         }
-        EditorUI::ccTouchEnded(touch, event);
+
+        auto const& piece = g_libraries[li].pieces[pi];
+
+        // EditorUI::pasteObjects already understands GD's normal object
+        // serialization, which is the format stored inside TBLIB 2 PIECES.
+        auto objects = m_editor->m_editorUI->pasteObjects(piece.objects, true, false);
+        if (!objects || objects->count() == 0) {
+            FLAlertLayer::create(
+                "TBLIB AutoBuild",
+                "The template contained no pasteable Geometry Dash objects.",
+                "OK"
+            )->show();
+            return;
+        }
+
+        float x = 0.f, y = 0.f;
+        auto xs = m_x->getString();
+        auto ys = m_y->getString();
+
+        bool haveX = parseFloat(xs, x);
+        bool haveY = parseFloat(ys, y);
+
+        if (haveX && haveY) {
+            m_editor->m_editorUI->repositionObjectsToCenter(objects, {x, y}, true);
+        } else {
+            // m_clickAtPosition is updated by the normal editor interaction.
+            auto target = m_editor->m_editorUI->m_clickAtPosition;
+            m_editor->m_editorUI->repositionObjectsToCenter(objects, target, true);
+        }
+
+        m_editor->m_editorUI->selectObjects(objects, false);
+
+        FLAlertLayer::create(
+            "TBLIB AutoBuild",
+            fmt::format("Placed <cy>{}</c> with {} objects.", piece.name, objects->count()).c_str(),
+            "OK"
+        )->show();
+
+        this->onClose(nullptr);
     }
 
-    void ccTouchCancelled(CCTouch* touch, CCEvent* event) {
-        if (m_fields->autoBuildActive) {
-            m_fields->visitedCells.clear();
-            m_fields->hasLastTouch = false;
-            return;
+    void onList(CCObject*) {
+        std::string text;
+        for (auto const& lib : g_libraries) {
+            text += fmt::format("<cy>{}</c>  [{} pieces]\\n", lib.name, lib.pieces.size());
         }
-        EditorUI::ccTouchCancelled(touch, event);
+        text += "\\nUse <cy>library:piece</c>, for example <cy>tech_temp:3</c>.";
+        FLAlertLayer::create("TBLIB Libraries", text.c_str(), "OK")->show();
+    }
+
+public:
+    static TemplatePopup* create(LevelEditorLayer* editor) {
+        auto ret = new TemplatePopup();
+        if (ret->init(editor)) {
+            ret->autorelease();
+            return ret;
+        }
+        delete ret;
+        return nullptr;
+    }
+};
+
+class $modify(TBLIBLevelEditor, LevelEditorLayer) {
+    struct Fields {
+        CCMenu* menu = nullptr;
+    };
+
+    bool init(GJGameLevel* level, bool p1) {
+        if (!LevelEditorLayer::init(level, p1))
+            return false;
+
+        loadLibraries();
+
+        auto menu = CCMenu::create();
+        menu->setPosition({0.f, 0.f});
+        this->addChild(menu, 9999);
+        m_fields->menu = menu;
+
+        auto button = CCMenuItemSpriteExtra::create(
+            ButtonSprite::create("TB"),
+            this,
+            menu_selector(TBLIBLevelEditor::onTBLIB)
+        );
+        button->setScale(.7f);
+
+        auto size = CCDirector::sharedDirector()->getWinSize();
+        button->setPosition({size.width - 55.f, size.height - 55.f});
+        menu->addChild(button);
+
+        return true;
+    }
+
+    void onTBLIB(CCObject*) {
+        auto popup = TemplatePopup::create(this);
+        if (popup)
+            popup->show();
     }
 };

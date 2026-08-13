@@ -1,17 +1,19 @@
 {
-	"geode": "5.8.2",
-	"gd": {
-		"win": "2.2081",
-		"android": "2.2081",
-		"mac": "2.2081",
-		"ios": "2.2081"
-	},
-	"id": "randomguy.mod",
-	"name": "Extra Tools",
-	"version": "1.0.0",
-	"developer": "Randomguy",
-	"description": "Extra",
-	"dependencies": {
-		"geode.node-ids": ">=v1.23.3"
-	}
+    "geode": "5.8.2",
+    "gd": {
+        "android": "2.2081",
+        "win": "2.2081",
+        "mac": "2.2081",
+        "ios": "2.2081"
+    },
+    "id": "diddy.tblib-autobuild",
+    "name": "TBLIB AutoBuild",
+    "version": "1.0.0",
+    "developer": "Diddy",
+    "description": "Loads TBLIB 2 autobuild template libraries and pastes selected PIECES templates into the Geometry Dash 2.2081 editor.",
+    "resources": {
+        "files": [
+            "templates"
+        ]
+    }
 }
